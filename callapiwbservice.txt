@@ -1,0 +1,241 @@
+1. Install Package yang Diperlukan
+ Copydotnet add package System.ServiceModel.Http
+dotnet add package System.ServiceModel.Primitives
+dotnet add package System.Xml.XmlDocument
+
+2. Buat Interface dan Service untuk SOAP Call
+ Copy// ISoapService.cs
+public interface ISoapService
+{
+    Task<string> CallAsmxServiceAsync(string url, string soapAction, string xmlBody);
+    Task<T> CallAsmxServiceAsync<T>(string url, string soapAction, string xmlBody);
+}
+
+// SoapService.cs
+public class SoapService : ISoapService
+{
+    private readonly HttpClient _httpClient;
+    private readonly ILogger<SoapService> _logger;
+
+    public SoapService(HttpClient httpClient, ILogger<SoapService> logger)
+    {
+        _httpClient = httpClient;
+        _logger = logger;
+    }
+
+    public async Task<string> CallAsmxServiceAsync(string url, string soapAction, string xmlBody)
+    {
+        try
+        {
+            // Buat SOAP Envelope
+            var soapEnvelope = CreateSoapEnvelope(xmlBody);
+            
+            // Buat HTTP Content
+            var content = new StringContent(soapEnvelope, Encoding.UTF8, "text/xml");
+            
+            // Set Headers
+            content.Headers.Clear();
+            content.Headers.Add("Content-Type", "text/xml; charset=utf-8");
+            content.Headers.Add("SOAPAction", $"\"{soapAction}\"");
+
+            _logger.LogInformation($"Calling SOAP service: {url}");
+            _logger.LogInformation($"SOAP Action: {soapAction}");
+            _logger.LogInformation($"Request Body: {soapEnvelope}");
+
+            // Kirim Request
+            var response = await _httpClient.PostAsync(url, content);
+            var responseContent = await response.Content.ReadAsStringAsync();
+
+            if (response.IsSuccessStatusCode)
+            {
+                _logger.LogInformation($"SOAP Response: {responseContent}");
+                return responseContent;
+            }
+            else
+            {
+                _logger.LogError($"SOAP call failed: {response.StatusCode} - {responseContent}");
+                throw new Exception($"SOAP call failed: {response.StatusCode} - {responseContent}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error calling SOAP service");
+            throw;
+        }
+    }
+
+    public async Task<T> CallAsmxServiceAsync<T>(string url, string soapAction, string xmlBody)
+    {
+        var response = await CallAsmxServiceAsync(url, soapAction, xmlBody);
+        return ParseSoapResponse<T>(response);
+    }
+
+    private string CreateSoapEnvelope(string body)
+    {
+        return $@"<?xml version=""1.0"" encoding=""utf-8""?>
+<soap:Envelope xmlns:soap=""http://schemas.xmlsoap.org/soap/envelope/"" 
+               xmlns:xsi=""http://www.w3.org/2001/XMLSchema-instance"" 
+               xmlns:xsd=""http://www.w3.org/2001/XMLSchema"">
+    <soap:Body>
+        {body}
+    </soap:Body>
+</soap:Envelope>";
+    }
+
+    private T ParseSoapResponse<T>(string soapResponse)
+    {
+        try
+        {
+            var doc = XDocument.Parse(soapResponse);
+            var body = doc.Descendants()
+                         .FirstOrDefault(x => x.Name.LocalName == "Body");
+            
+            if (body != null)
+            {
+                var result = body.Elements().FirstOrDefault();
+                if (result != null)
+                {
+                    var json = JsonConvert.SerializeObject(XmlToJson(result));
+                    return JsonConvert.DeserializeObject<T>(json);
+                }
+            }
+            
+            return default(T);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error parsing SOAP response");
+            throw;
+        }
+    }
+
+    private object XmlToJson(XElement element)
+    {
+        if (element.HasElements)
+        {
+            var dict = new Dictionary<string, object>();
+            foreach (var child in element.Elements())
+            {
+                dict[child.Name.LocalName] = XmlToJson(child);
+            }
+            return dict;
+        }
+        return element.Value;
+    }
+}
+
+
+3. Buat Models untuk Request dan Response
+ Copy// Models/SoapModels.cs
+public class SoapRequestModel
+{
+    public string ServiceUrl { get; set; }
+    public string SoapAction { get; set; }
+    public string XmlBody { get; set; }
+    public Dictionary<string, object> Parameters { get; set; }
+}
+
+public class SoapResponseModel
+{
+    public bool Success { get; set; }
+    public string RawResponse { get; set; }
+    public object Data { get; set; }
+    public string Error { get; set; }
+}
+
+public class UserInfoRequest
+{
+    public string UserId { get; set; }
+    public string UserName { get; set; }
+}
+
+public class UserInfoResponse
+{
+    public string Id { get; set; }
+    public string Name { get; set; }
+    public string Email { get; set; }
+    public string Status { get; set; }
+}
+
+4. Registrasi Service di Program.cs
+ Copy// Program.cs
+var builder = WebApplication.CreateBuilder(args);
+
+// Add services to the container
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+// Register HttpClient dan SoapService
+builder.Services.AddHttpClient<ISoapService, SoapService>(client =>
+{
+    client.Timeout = TimeSpan.FromMinutes(5);
+});
+
+builder.Services.AddScoped<ISoapService, SoapService>();
+
+// Add logging
+builder.Services.AddLogging();
+
+var app = builder.Build();
+
+// Configure the HTTP request pipeline
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+app.UseHttpsRedirection();
+app.UseAuthorization();
+app.MapControllers();
+
+app.Run();
+
+
+5. Buat Controller untuk SOAP Calls
+ Copy// Controllers/SoapController.cs
+[ApiController]
+[Route("api/[controller]")]
+public class SoapController : ControllerBase
+{
+    private readonly ISoapService _soapService;
+    private readonly ILogger<SoapController> _logger;
+
+    public SoapController(ISoapService soapService, ILogger<SoapController> logger)
+    {
+        _soapService = soapService;
+        _logger = logger;
+    }
+
+    [HttpPost("call-asmx")]
+    public async Task<IActionResult> CallAsmxService([FromBody] SoapRequestModel request)
+    {
+        try
+        {
+            var result = await _soapService.CallAsmxServiceAsync(
+                request.ServiceUrl,
+                request.SoapAction,
+                request.XmlBody
+            );
+
+            return Ok(new SoapResponseModel
+            {
+                Success = true,
+                RawResponse = result,
+                Data = result
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error calling ASMX service");
+            return BadRequest(new SoapResponseModel
+            {
+                Success = false,
+                Error = ex.Message
+            });
+        }
+    }
+
+    [HttpPost("get-user-info")]
+    public async Task<IActionResult> GetUserInfo
